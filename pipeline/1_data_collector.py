@@ -26,8 +26,35 @@ SYMBOL = "BTCUSDT"
 DATA_DIR = "./data"
 os.makedirs(DATA_DIR, exist_ok=True)
 
-BINANCE_BASE = "https://fapi.binance.com"  # Futures API (has liquidations, funding)
+# ─────────────────────────────────────────
+# EXCHANGE CONFIG
+# Binance geo-blocks some regions/VMs.
+# Set EXCHANGE = "bybit" or "okx" as fallback.
+# ─────────────────────────────────────────
+import os as _os
+EXCHANGE_CHOICE = _os.environ.get("EXCHANGE", "binance").lower()
+
+BINANCE_BASE  = "https://fapi.binance.com"
+BYBIT_BASE    = "https://api.bybit.com"
+OKX_BASE      = "https://www.okx.com"
+
 COINGLASS_BASE = "https://open-api.coinglass.com/public/v2"
+
+def _test_binance():
+    try:
+        import requests as _r
+        resp = _r.get("https://fapi.binance.com/fapi/v1/ping", timeout=5)
+        return resp.status_code == 200
+    except:
+        return False
+
+# Auto-detect: try Binance first, fall back to Bybit
+if EXCHANGE_CHOICE == "binance":
+    if not _test_binance():
+        print("[!] Binance unreachable (geo-block?) — switching to Bybit")
+        EXCHANGE_CHOICE = "bybit"
+
+print(f"[Exchange] Using: {EXCHANGE_CHOICE.upper()}")
 
 
 # ─────────────────────────────────────────
@@ -36,19 +63,25 @@ COINGLASS_BASE = "https://open-api.coinglass.com/public/v2"
 def fetch_order_book(symbol=SYMBOL, limit=100):
     """
     Fetch current order book snapshot.
-    Returns bid/ask walls and imbalance ratio.
-    
-    Imbalance > 0.6 = more buying pressure
-    Imbalance < 0.4 = more selling pressure
+    Supports Binance Futures and Bybit.
     """
-    url = f"{BINANCE_BASE}/fapi/v1/depth"
-    params = {"symbol": symbol, "limit": limit}
-    
-    r = requests.get(url, params=params)
-    data = r.json()
-    
-    bids = pd.DataFrame(data["bids"], columns=["price", "qty"], dtype=float)
-    asks = pd.DataFrame(data["asks"], columns=["price", "qty"], dtype=float)
+    if EXCHANGE_CHOICE == "bybit":
+        url = f"{BYBIT_BASE}/v5/market/orderbook"
+        params = {"category": "linear", "symbol": symbol, "limit": limit}
+        r = requests.get(url, params=params, timeout=10)
+        data = r.json()
+        raw = data.get("result", {})
+        bids = pd.DataFrame(raw.get("b", []), columns=["price", "qty"], dtype=float)
+        asks = pd.DataFrame(raw.get("a", []), columns=["price", "qty"], dtype=float)
+    else:
+        url = f"{BINANCE_BASE}/fapi/v1/depth"
+        params = {"symbol": symbol, "limit": limit}
+        r = requests.get(url, params=params, timeout=10)
+        data = r.json()
+        if "bids" not in data:
+            raise ConnectionError(f"Binance blocked (code={data.get('code')}): {data.get('msg')}. Try: export EXCHANGE=bybit")
+        bids = pd.DataFrame(data["bids"], columns=["price", "qty"], dtype=float)
+        asks = pd.DataFrame(data["asks"], columns=["price", "qty"], dtype=float)
     
     total_bid_volume = bids["qty"].sum()
     total_ask_volume = asks["qty"].sum()
@@ -99,11 +132,24 @@ def fetch_recent_trades(symbol=SYMBOL, limit=1000):
     Rising CVD with rising price = strong move
     Divergence = potential reversal
     """
-    url = f"{BINANCE_BASE}/fapi/v1/aggTrades"
-    params = {"symbol": symbol, "limit": limit}
-    
-    r = requests.get(url, params=params)
-    trades = pd.DataFrame(r.json())
+    if EXCHANGE_CHOICE == "bybit":
+        url = f"{BYBIT_BASE}/v5/market/recent-trade"
+        params = {"category": "linear", "symbol": symbol, "limit": min(limit, 1000)}
+        r = requests.get(url, params=params, timeout=10)
+        raw = r.json().get("result", {}).get("list", [])
+        trades = pd.DataFrame(raw)
+        if trades.empty:
+            raise ValueError("No trade data from Bybit")
+        trades = trades.rename(columns={"T": "T", "p": "p", "v": "q", "S": "side_str"})
+        trades["p"] = trades["price"].astype(float)
+        trades["q"] = trades["size"].astype(float)
+        trades["T"] = pd.to_datetime(trades["time"].astype(float), unit="ms")
+        trades["m"] = trades["side"] == "Sell"  # True = seller aggressor
+    else:
+        url = f"{BINANCE_BASE}/fapi/v1/aggTrades"
+        params = {"symbol": symbol, "limit": limit}
+        r = requests.get(url, params=params, timeout=10)
+        trades = pd.DataFrame(r.json())
     
     trades["price"] = trades["p"].astype(float)
     trades["qty"] = trades["q"].astype(float)
@@ -146,11 +192,21 @@ def fetch_funding_rate(symbol=SYMBOL):
     
     Extreme funding rates often precede reversals.
     """
-    url = f"{BINANCE_BASE}/fapi/v1/premiumIndex"
-    params = {"symbol": symbol}
-    
-    r = requests.get(url, params=params)
-    data = r.json()
+    if EXCHANGE_CHOICE == "bybit":
+        url = f"{BYBIT_BASE}/v5/market/tickers"
+        params = {"category": "linear", "symbol": symbol}
+        r = requests.get(url, params=params, timeout=10)
+        raw = r.json().get("result", {}).get("list", [{}])[0]
+        data = {
+            "lastFundingRate": raw.get("fundingRate", 0),
+            "markPrice":       raw.get("markPrice", 0),
+            "indexPrice":      raw.get("indexPrice", 0),
+        }
+    else:
+        url = f"{BINANCE_BASE}/fapi/v1/premiumIndex"
+        params = {"symbol": symbol}
+        r = requests.get(url, params=params, timeout=10)
+        data = r.json()
     
     funding_rate = float(data["lastFundingRate"])
     
@@ -186,11 +242,17 @@ def fetch_open_interest(symbol=SYMBOL):
     Rising price + falling OI = short squeeze (weaker move)
     Falling price + rising OI = strong downtrend
     """
-    url = f"{BINANCE_BASE}/fapi/v1/openInterest"
-    params = {"symbol": symbol}
-    
-    r = requests.get(url, params=params)
-    data = r.json()
+    if EXCHANGE_CHOICE == "bybit":
+        url = f"{BYBIT_BASE}/v5/market/tickers"
+        params = {"category": "linear", "symbol": symbol}
+        r = requests.get(url, params=params, timeout=10)
+        raw = r.json().get("result", {}).get("list", [{}])[0]
+        data = {"openInterest": raw.get("openInterest", 0)}
+    else:
+        url = f"{BINANCE_BASE}/fapi/v1/openInterest"
+        params = {"symbol": symbol}
+        r = requests.get(url, params=params, timeout=10)
+        data = r.json()
     
     # Historical OI for trend
     url_hist = f"{BINANCE_BASE}/futures/data/openInterestHist"
@@ -227,6 +289,10 @@ def fetch_liquidations(symbol=SYMBOL):
     Note: Binance removed real-time liquidation feed from public API.
     We use the liquidation orders endpoint.
     """
+    if EXCHANGE_CHOICE == "bybit":
+        url = f"{BYBIT_BASE}/v5/market/recent-trade"  # Bybit doesn't have public liq endpoint
+        return {"timestamp": datetime.now(timezone.utc).isoformat(),
+                "total_liquidations": 0, "note": "Bybit liquidations require auth"}
     url = f"{BINANCE_BASE}/fapi/v1/forceOrders"
     params = {"symbol": symbol, "limit": 100}
     
@@ -272,11 +338,22 @@ def fetch_klines(symbol=SYMBOL, interval="5m", limit=100):
     Standard candlestick data.
     Used for price context and basic features.
     """
-    url = f"{BINANCE_BASE}/fapi/v1/klines"
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
-    
-    r = requests.get(url, params=params)
-    data = r.json()
+    if EXCHANGE_CHOICE == "bybit":
+        url = f"{BYBIT_BASE}/v5/market/kline"
+        params = {"category": "linear", "symbol": symbol, "interval": interval.replace("m","").replace("h","60"), "limit": limit}
+        r = requests.get(url, params=params, timeout=10)
+        data = r.json().get("result", {}).get("list", [])
+        # Bybit returns [startTime, open, high, low, close, volume, turnover]
+        # Reformat to match Binance 12-column format
+        data = [[d[0], d[1], d[2], d[3], d[4], d[5],
+                 d[0], d[6], 0, str(float(d[5])*0.5), str(float(d[6])*0.5), "0"]
+                for d in data]
+        data = list(reversed(data))  # Bybit returns newest first
+    else:
+        url = f"{BINANCE_BASE}/fapi/v1/klines"
+        params = {"symbol": symbol, "interval": interval, "limit": limit}
+        r = requests.get(url, params=params, timeout=10)
+        data = r.json()
     
     df = pd.DataFrame(data, columns=[
         "open_time", "open", "high", "low", "close", "volume",

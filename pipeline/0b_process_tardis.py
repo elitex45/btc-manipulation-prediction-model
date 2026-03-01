@@ -170,23 +170,28 @@ def process_trades(filepath, freq="5min"):
     df["is_buy"] = (df["side"] == "buy").astype(float)
     df["dollar_volume"] = df["price"] * df["amount"]
 
-    # Per-bar aggregation
+    # Pre-compute buy volume and dollar-weighted price before resampling
+    df["buy_vol"]     = df["amount"].where(df["side"] == "buy", 0)
+    df["dollar_vol"]  = df["price"] * df["amount"]
+    df["price_x_amt"] = df["price"] * df["amount"]  # for VWAP numerator
+
     df = df.set_index("ts")
     resampled = df.resample(freq).agg(
-        cvd_net          = ("delta",        "sum"),
-        cvd_buy_vol      = ("amount",       lambda x: x[df.loc[x.index, "side"] == "buy"].sum() if len(x) > 0 else 0),
-        cvd_total_vol    = ("amount",       "sum"),
-        cvd_trade_count  = ("amount",       "count"),
-        cvd_dollar_vol   = ("dollar_volume","sum"),
-        cvd_avg_size     = ("amount",       "mean"),
-        cvd_max_size     = ("amount",       "max"),
-        cvd_vwap         = ("price",        lambda x: (x * df.loc[x.index, "amount"]).sum() / df.loc[x.index, "amount"].sum() if len(x) > 0 else np.nan),
+        cvd_net         = ("delta",       "sum"),
+        cvd_buy_vol     = ("buy_vol",     "sum"),
+        cvd_total_vol   = ("amount",      "sum"),
+        cvd_trade_count = ("amount",      "count"),
+        cvd_dollar_vol  = ("dollar_vol",  "sum"),
+        cvd_avg_size    = ("amount",      "mean"),
+        cvd_max_size    = ("amount",      "max"),
+        cvd_vwap_num    = ("price_x_amt", "sum"),
     )
 
     resampled["cvd_buy_ratio"]    = resampled["cvd_buy_vol"] / (resampled["cvd_total_vol"] + 1e-10)
     resampled["cvd_large_trades"] = resampled["cvd_max_size"] / (resampled["cvd_avg_size"] + 1e-10)
-    # Cumulative CVD for the day (resets each bar file)
     resampled["cvd_cumulative"]   = resampled["cvd_net"].cumsum()
+    resampled["cvd_vwap"]         = resampled["cvd_vwap_num"] / (resampled["cvd_dollar_vol"] + 1e-10)
+    resampled = resampled.drop(columns=["cvd_vwap_num"])
 
     print(f"    Rows: {len(df):,} trades → {len(resampled):,} {freq} bars")
     return resampled
@@ -204,7 +209,11 @@ def process_liquidations(filepath, freq="5min"):
           'buy'  = short position liquidated (forced buying)
     """
     print(f"  Processing liquidations: {os.path.basename(filepath)}")
-    df = pd.read_csv(filepath, low_memory=False)
+    try:
+        df = pd.read_csv(filepath, low_memory=False)
+    except pd.errors.EmptyDataError:
+        print(f"    Empty file — no liquidations this day")
+        return pd.DataFrame()
 
     if len(df) == 0:
         print("    Empty file — no liquidations this day")
@@ -274,8 +283,10 @@ def process_derivative_ticker(filepath, freq="5min"):
         agg_dict["deriv_mark_price"]    = ("markPrice",    "last")
 
     if not agg_dict:
+        print(f"    [!] No usable columns in derivative ticker file")
         return pd.DataFrame()
 
+    print(f"    Columns found: {list(agg_dict.keys())}")
     resampled = df.resample(freq).agg(**agg_dict)
 
     if "deriv_open_interest" in resampled.columns:
@@ -426,6 +437,24 @@ def process_month(year, month, freq="5min"):
     if not frames:
         print(f"  No data found for {month_str}")
         return None
+
+    # Normalize all indexes to UTC-aware DatetimeIndex before merging
+    for name in list(frames.keys()):
+        df = frames[name]
+        idx = df.index
+        # Skip if not a DatetimeIndex (e.g. RangeIndex from failed resample)
+        if not isinstance(idx, pd.DatetimeIndex):
+            try:
+                frames[name].index = pd.to_datetime(idx, utc=True)
+            except Exception:
+                print(f"    [!] Dropping {name} — could not convert index to DatetimeIndex")
+                del frames[name]
+                continue
+            idx = frames[name].index
+        if idx.tz is None:
+            frames[name].index = idx.tz_localize("UTC")
+        else:
+            frames[name].index = idx.tz_convert("UTC")
 
     # Merge all on timestamp index
     merged = None
